@@ -1,0 +1,6 @@
+{
+  "Creator": {
+    "display": "Creator display name",
+    "aliases": ["twitch_name", "youtube_name", "short_name", "fandom_name"]
+  }
+}

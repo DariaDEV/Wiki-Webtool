@@ -1,0 +1,228 @@
+from datetime import date
+
+from babel.dates import format_date, get_month_names
+
+from data_cleaning import canonical_name, normalize_calendar_date, is_excluded_creator
+
+SUPPORTED_LOCALES = {"en", "pl"}
+SERVER_DAY_ONE_DATE = date(2026, 10, 21)
+
+
+def _validate_locale(locale):
+    normalized = (locale or "en").lower()
+    if normalized not in SUPPORTED_LOCALES:
+        raise ValueError(f"Unsupported locale: {locale!r}. Supported locales: {sorted(SUPPORTED_LOCALES)}")
+    return normalized
+
+
+# -----------------------------
+# Date Formatting
+# -----------------------------
+def convert_date_to_wiki_format(date_str):
+    """
+    Converts dates from formats like:
+    - 'DD.MM.YYYY'
+    - 'YYYY-MM-DD'
+    - 'DD/MM/YYYY'
+    into the wiki format: 'YYYY-MM-DD'
+    """
+
+    if "-" in date_str and len(date_str.split("-")[0]) == 4:
+        return date_str
+
+    if "." in date_str:
+        day, month, year = date_str.split(".")
+        return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+
+    if "/" in date_str:
+        day, month, year = date_str.split("/")
+        return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+
+    return date_str
+
+
+def _as_iso_date(date_str):
+    if isinstance(date_str, date):
+        return date_str
+    if isinstance(date_str, str):
+        return date.fromisoformat(date_str)
+    raise TypeError(f"Unsupported date value: {type(date_str).__name__}")
+
+
+def format_wiki_date(date_str, locale="en"):
+    """Return a language-specific wiki date string.
+
+    English keeps the current ordinal format: "June 2nd, 2026".
+    Polish uses the localized calendar format: "2 czerwca 2026".
+    """
+    locale = _validate_locale(locale)
+    parsed_date = _as_iso_date(date_str)
+
+    if locale == "pl":
+        return format_date(parsed_date, format="d MMMM y", locale=locale)
+
+    year = str(parsed_date.year)
+    month = parsed_date.month
+    day = parsed_date.day
+
+    month_names = get_month_names(width="wide", locale=locale, context="format")
+    month_name = month_names[month]
+
+    if 11 <= day <= 13:
+        suffix = "th"
+    else:
+        last = day % 10
+        if last == 1:
+            suffix = "st"
+        elif last == 2:
+            suffix = "nd"
+        elif last == 3:
+            suffix = "rd"
+        else:
+            suffix = "th"
+
+    return f"{month_name} {day}{suffix}, {year}"
+
+
+def format_month_heading(date_str, locale="en"):
+    locale = _validate_locale(locale)
+    parsed_date = _as_iso_date(date_str)
+    month_names = get_month_names(width="wide", locale=locale, context="stand-alone")
+    month_name = month_names[parsed_date.month]
+    return month_name.capitalize() if locale == "pl" else month_name
+
+
+def _infer_server_day(calendar_day):
+    parsed_date = _as_iso_date(calendar_day)
+    if parsed_date < SERVER_DAY_ONE_DATE:
+        return None
+    return (parsed_date - SERVER_DAY_ONE_DATE).days + 1
+
+
+# -----------------------------
+# Merge Logic
+# -----------------------------
+def merge_activity_with_vods(grouped_activity, vod_index, creators_json, timeline_date_to_day):
+    merged = {}
+
+    allowed_creators = set(creators_json.keys())
+    all_days = set()
+
+    # Collect activity days
+    for creator, days in grouped_activity.items():
+        if creator in allowed_creators:
+            for entry in days:
+                all_days.add((creator, entry["calendar_day"]))
+
+    # Collect VOD days
+    for (creator, date) in vod_index.keys():
+        if creator in allowed_creators:
+            all_days.add((creator, date))
+
+    # Merge
+    for creator, date in sorted(all_days):
+
+        # DEBUG 1 — show what merge is trying to match
+        # print("MERGE CHECK:", creator, date)
+
+        # Find activity entry
+        activity_entry = next(
+            (e for e in grouped_activity.get(creator, []) if e["calendar_day"] == date),
+            None
+        )
+
+        # Find VOD
+        vod_records = vod_index.get((creator, date), [])
+        if isinstance(vod_records, dict):
+            vod_records = [vod_records]
+
+        vod_server_days = [
+            record.get("server_day")
+            for record in vod_records
+            if record.get("server_day") is not None
+        ]
+
+        if vod_server_days:
+            server_day = vod_server_days[0]
+        elif activity_entry and activity_entry.get("server_day") is not None:
+            server_day = activity_entry["server_day"]
+        else:
+            server_day = timeline_date_to_day.get(date)
+            if server_day is None:
+                server_day = _infer_server_day(date)
+            if server_day is None:
+                server_day = "—"
+
+        # DEBUG 2 — show server day decision
+        # print("SERVER DAY DECISION:", creator, date, "→", server_day)
+
+        vod_urls = [record.get("url", "UNAVAILABLE") for record in vod_records]
+        vod = "\n".join(url for url in vod_urls if url != "UNAVAILABLE") or "UNAVAILABLE"
+
+        # DEBUG 3 — show VOD match
+        # print("VOD MATCH:", creator, date, "→", vod)
+
+        merged.setdefault(creator, []).append({
+            "server_day": server_day,
+            "calendar_day": date,
+            "wiki_date": format_wiki_date(date),
+            "vod": vod,
+            "vods": vod_records,
+            "creator": creator,
+        })
+
+    return merged
+
+# -----------------------------
+# Grouping + Helpers
+# -----------------------------
+def group_days_by_creator(activity_rows):
+    grouped = {}
+
+    for row in activity_rows:
+        creator = row["creator"]
+
+        if creator not in grouped:
+            grouped[creator] = []
+
+        grouped[creator].append({
+            "server_day": row["server_day"],
+            "calendar_day": row["calendar_day"]
+        })
+
+    return grouped
+
+
+def get_all_creators(merged_data):
+    return sorted(merged_data.keys())
+
+
+def get_creator_full_history(merged_data, creator):
+    return merged_data.get(creator, [])
+
+
+def find_vod_without_activity(grouped_activity, vod_index):
+    activity_keys = {
+        (canonical_name(creator), normalize_calendar_date(entry["calendar_day"]))
+        for creator, entries in grouped_activity.items()
+        for entry in entries
+        if not is_excluded_creator(creator)
+    }
+
+    return sorted(
+        [
+            {
+                "creator": canonical_name(creator),
+                "calendar_day": normalized_date,
+                "vod": record.get("url", ""),
+                "vod_title": record.get("title", ""),
+            }
+            for (creator, date), vod_record in vod_index.items()
+            for record in (vod_record if isinstance(vod_record, list) else [vod_record])
+            for normalized_date in [normalize_calendar_date(date)]
+            if normalized_date is not None
+            and not is_excluded_creator(creator)
+            and (canonical_name(creator), normalized_date) not in activity_keys
+        ],
+        key=lambda entry: (entry["calendar_day"], entry["creator"])
+    )
